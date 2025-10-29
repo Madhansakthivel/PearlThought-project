@@ -1,13 +1,10 @@
-import sqlite3 from 'sqlite3';
-import { promisify } from 'util';
-import { Task, SyncQueueItem } from '../types';
-
+import * as sqlite3 from 'sqlite3';
 const sqlite = sqlite3.verbose();
 
 export class Database {
   private db: sqlite3.Database;
 
-  constructor(filename: string = ':memory:') {
+  constructor(filename: string = 'data.db') {
     this.db = new sqlite.Database(filename);
   }
 

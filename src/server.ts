@@ -16,7 +16,7 @@ app.use(cors());
 app.use(express.json());
 
 // Initialize database
-const db = new Database(process.env.DATABASE_URL || './data/tasks.sqlite3');
+const db = new Database(process.env.DATABASE_URL || './db/data.db');
 
 // Routes
 app.use('/api/tasks', createTaskRouter(db));
