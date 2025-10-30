@@ -30,19 +30,29 @@ export class Database {
 
     const createSyncQueueTable = `
       CREATE TABLE IF NOT EXISTS sync_queue (
-        id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        data TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        retry_count INTEGER DEFAULT 0,
-        error_message TEXT,
-        FOREIGN KEY (task_id) REFERENCES tasks(id)
-      )
-    `;
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT,
+    operation_type TEXT,
+    task_snapshot TEXT,
+    attempts INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`;
+
+    const deadLetterQueue = `CREATE TABLE IF NOT EXISTS dead_letter_queue (
+    id TEXT PRIMARY KEY,
+    task_id TEXT,
+    operation TEXT,
+    data TEXT,
+    error_message TEXT,
+    failed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`
 
     await this.run(createTasksTable);
     await this.run(createSyncQueueTable);
+    await this.run(deadLetterQueue);
   }
 
   // Helper methods

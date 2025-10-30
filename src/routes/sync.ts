@@ -3,6 +3,7 @@ import { SyncService } from '../services/syncService';
 import { TaskService } from '../services/taskService';
 import { Database } from '../db/database';
 import dns from 'dns';
+import crypto from 'crypto';
 
 export function createSyncRouter(db: Database): Router {
   const router = Router();
@@ -10,18 +11,15 @@ export function createSyncRouter(db: Database): Router {
   const syncService = new SyncService(db, taskService);
 
 
-// POST /api/sync → Trigger manual sync
 router.post('/sync', async (req: Request, res: Response) => {
   try {
-    // 1️⃣ Check if online (basic DNS check)
+
     await new Promise<void>((resolve, reject) => {
       dns.lookup('google.com', (err) => (err ? reject(err) : resolve()));
     });
 
-    // 2️⃣ Run main sync
     const result = await syncService.sync();
 
-    // 3️⃣ Respond with structured result
     res.status(200).json({
       message: result.success ? 'Sync completed successfully' : 'Sync completed with some errors',
       result,
@@ -32,7 +30,6 @@ router.post('/sync', async (req: Request, res: Response) => {
   }
 });
 
-  // Check sync status
 router.get('/status', async (req, res) => {
   try {
     const [pending] = await db.get(`SELECT COUNT(*) as count FROM sync_queue`);
@@ -53,16 +50,25 @@ router.get('/status', async (req, res) => {
 });
 
 
-  // Batch sync endpoint (for server-side)
+  function verifyChecksum(items: any[], checksum: string): boolean {
+  const dataString = items.map(i => i.id + JSON.stringify(i.data)).join('');
+  const computed = crypto.createHash('sha256').update(dataString).digest('hex');
+  return computed === checksum;
+}
+
 router.post('/batch', async (req: Request, res: Response) => {
   try {
-    const batch = req.body; // [{ operation: 'create' | 'update' | 'delete', data: Task }]
+    const { items, checksum } = req.body;
+
+    if (!verifyChecksum(items, checksum)) {
+      return res.status(400).json({ error: 'Checksum verification failed' });
+    }
+
     const results: any[] = [];
 
-    for (const item of batch) {
+    for (const item of items) {
       try {
         let resultData;
-
         if (item.operation === 'create') {
           resultData = await taskService.createTask(item.data);
         } else if (item.operation === 'update') {
@@ -72,39 +78,24 @@ router.post('/batch', async (req: Request, res: Response) => {
           resultData = { deleted };
         }
 
-        results.push({
-          task_id: item.data.id,
-          operation: item.operation,
-          success: true,
-          data: resultData,
-        });
+        results.push({ ...item, success: true, data: resultData });
       } catch (err) {
-        results.push({
-          task_id: item.data.id,
-          operation: item.operation,
-          success: false,
-          error: (err as Error).message,
-        });
+        results.push({ ...item, success: false, error: (err as Error).message });
       }
     }
 
-    res.status(200).json({
+    res.json({
       success: true,
       results,
       synced_items: results.filter(r => r.success).length,
-      failed_items: results.filter(r => !r.success).length,
+      failed_items: results.filter(r => !r.success).length
     });
   } catch (error) {
-    console.error('Batch sync error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error during batch sync',
-    });
+    res.status(500).json({ error: 'Internal server error during batch sync' });
   }
 });
 
 
-  // Health check endpoint
 router.get('/health', async (req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',

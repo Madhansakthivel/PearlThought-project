@@ -2,9 +2,21 @@ import axios from 'axios';
 import { Task, SyncQueueItem, SyncResult, SyncError, BatchSyncRequest, BatchSyncResponse } from '../types';
 import { Database } from '../db/database';
 import { TaskService } from './taskService';
+import crypto from 'crypto';
+
+
 
 export class SyncService {
   private apiUrl: string;
+
+  private calculateChecksum(items: SyncQueueItem[]): string {
+  const dataString = items
+    .map(item => item.id + JSON.stringify(item.data))
+    .join('');
+
+  return crypto.createHash('sha256').update(dataString).digest('hex');
+}
+
   
   constructor(
     private db: Database,
@@ -18,10 +30,9 @@ export class SyncService {
   async sync(): Promise<SyncResult> {
     const SYNC_BATCH_SIZE = parseInt(process.env.SYNC_BATCH_SIZE || '50', 10);
 
-    // 1️⃣ Get all items from sync queue (pending or failed)
     const queueItems: SyncQueueItem[] = await this.db.all(`
       SELECT * FROM sync_queue
-      WHERE retry_count < 3
+      WHERE attempts < 3
       ORDER BY created_at ASC
     `);
 
@@ -38,13 +49,11 @@ export class SyncService {
     let failedCount = 0;
     const errors: SyncError[] = [];
 
-    // 2️⃣ Split into batches
     for (let i = 0; i < queueItems.length; i += SYNC_BATCH_SIZE) {
       const batch = queueItems.slice(i, i + SYNC_BATCH_SIZE);
 
       for (const item of batch) {
         try {
-          // 3️⃣ Determine operation type
           if (item.operation === 'create') {
             await axios.post('https://yourserver.com/api/tasks', item.data);
           } else if (item.operation === 'update') {
@@ -52,20 +61,18 @@ export class SyncService {
           } else if (item.operation === 'delete') {
             await axios.delete(`https://yourserver.com/api/tasks/${item.task_id}`);
           }
-
-          // 4️⃣ On success → update task + remove queue item
           await this.db.run(`DELETE FROM sync_queue WHERE id = ?`, [item.id]);
           await this.taskService.markTaskAsSynced(item.task_id);
           syncedCount++;
 
         } catch (err: any) {
-          // 5️⃣ On failure → increment retry count + store error
+
           failedCount++;
           const errorMessage = err.message || 'Unknown sync error';
 
           await this.db.run(
             `UPDATE sync_queue
-             SET retry_count = retry_count + 1,
+             SET attempts = attempts + 1,
                  error_message = ?
              WHERE id = ?`,
             [errorMessage, item.id]
@@ -81,7 +88,7 @@ export class SyncService {
       }
     }
 
-    // 6️⃣ Return summary
+
     return {
       success: failedCount === 0,
       synced_items: syncedCount,
@@ -102,78 +109,101 @@ async addToSyncQueue(taskId: string, operation: 'create' | 'update' | 'delete', 
 }
 
 private async processBatch(items: SyncQueueItem[]): Promise<BatchSyncResponse> {
-  const payload = items.map(item => ({
-    operation: item.operation,
-    data: item.data
-  }));
-
   try {
-    const response = await axios.post(`${this.apiUrl}/sync/batch`, payload);
-    const results = response.data.results;
 
-    for (const result of results) {
-      if (result.success) {
-        await this.updateSyncStatus(result.task_id, 'synced', result.data);
-      } else {
-        const item = items.find(i => i.task_id === result.task_id);
-        if (item) await this.handleSyncError(item, new Error(result.error));
-      }
-    }
+    const checksum = this.calculateChecksum(items);
+
+    const payload = {
+      checksum,
+      items
+    };
+
+
+    const response = await axios.post(`${this.apiUrl}/batch`, payload);
+
 
     return response.data;
   } catch (error) {
-    for (const item of items) {
-      await this.handleSyncError(item, error as Error);
-    }
-    throw error;
+    throw new Error('Batch processing failed: ' + (error as Error).message);
   }
 }
 
 
+
 private async resolveConflict(localTask: Task, serverTask: Task): Promise<Task> {
-  const localUpdated = new Date(localTask.updated_at).getTime();
-  const serverUpdated = new Date(serverTask.updated_at).getTime();
+  const localTime = new Date(localTask.updated_at).getTime();
+  const serverTime = new Date(serverTask.updated_at).getTime();
 
-  const resolved = localUpdated > serverUpdated ? localTask : serverTask;
+  if (localTime > serverTime) return localTask;
+  if (serverTime > localTime) return serverTask;
 
-  console.log(`[Conflict] Task ${localTask.id} resolved by ${resolved === localTask ? 'local' : 'server'} version.`);
-  return resolved;
+  const priority: Record<'create' | 'update' | 'delete', number> = {
+    create: 1,
+    update: 2,
+    delete: 3,
+  };
+
+  const localPriority = priority['update'];
+  const serverPriority = priority['update'];
+
+  if (localTask.is_deleted && !serverTask.is_deleted) return localTask;
+  if (serverTask.is_deleted && !localTask.is_deleted) return serverTask;
+
+  return localTask;
 }
 
 
-private async updateSyncStatus(taskId: string, status: 'synced' | 'error', serverData?: Partial<Task>): Promise<void> {
+
+
+private async updateSyncStatus(
+  taskId: string,
+  status: 'pending' | 'in-progress' | 'synced' | 'error' | 'failed',
+  serverData?: Partial<Task>
+): Promise<void> {
   const now = new Date().toISOString();
-  
+
   await this.db.run(
-    `UPDATE tasks
-     SET sync_status = ?, last_synced_at = ?, server_id = COALESCE(?, server_id)
-     WHERE id = ?`,
-    [status, now, serverData?.server_id ?? null, taskId]
+    `
+      UPDATE tasks
+      SET 
+        sync_status = ?,
+        server_id = COALESCE(?, server_id),
+        last_synced_at = ?
+      WHERE id = ?
+    `,
+    [status, serverData?.server_id ?? null, now, taskId]
   );
 
-  if (status === 'synced') {
+  if (status === 'synced' || status === 'failed') {
     await this.db.run(`DELETE FROM sync_queue WHERE task_id = ?`, [taskId]);
   }
 }
 
 
-private async handleSyncError(item: SyncQueueItem, error: Error): Promise<void> {
-  const MAX_RETRIES = 3;
-  const newCount = item.retry_count + 1;
 
-  if (newCount >= MAX_RETRIES) {
+private async handleSyncError(item: SyncQueueItem, error: Error): Promise<void> {
+  const newCount = item.retry_count + 1;
+  const errorMsg = error.message;
+
+  if (newCount >= 3) {
+    await this.db.run(`
+      INSERT INTO dead_letter_queue (id, task_id, operation, data, error_message)
+      VALUES (?, ?, ?, ?, ?)
+    `, [item.id, item.task_id, item.operation, JSON.stringify(item.data), errorMsg]);
+
+    await this.updateSyncStatus(item.task_id, 'failed');
+  } else {
+
+    await this.db.run(`
+      UPDATE sync_queue
+      SET retry_count = ?, error_message = ?
+      WHERE id = ?
+    `, [newCount, errorMsg, item.id]);
+
     await this.updateSyncStatus(item.task_id, 'error');
   }
-
-  await this.db.run(
-    `UPDATE sync_queue
-     SET retry_count = ?, error_message = ?
-     WHERE id = ?`,
-    [newCount, error.message, item.id]
-  );
-
-  console.error(`Sync failed for ${item.task_id}: ${error.message}`);
 }
+
 
 
 async checkConnectivity(): Promise<boolean> {
@@ -181,7 +211,7 @@ async checkConnectivity(): Promise<boolean> {
     const response = await axios.get(`${this.apiUrl}/health`, { timeout: 5000 });
     return response.status === 200;
   } catch (error) {
-    console.warn('⚠️ Server not reachable:', (error as Error).message);
+    console.warn('Server not reachable:', (error as Error).message);
     return false;
   }
 }

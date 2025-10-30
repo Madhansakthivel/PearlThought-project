@@ -1,12 +1,11 @@
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
+import path from 'path';
+import fs from 'fs';
 import { Database } from './db/database';
 import { createTaskRouter } from './routes/tasks';
 import { createSyncRouter } from './routes/sync';
 import { errorHandler } from './middleware/errorHandler';
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,8 +14,15 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Ensure database directory exists
+const dbPath = path.join(__dirname, 'db', 'data.db');
+const dbDir = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+
 // Initialize database
-const db = new Database(process.env.DATABASE_URL || './db/data.db');
+const db = new Database(dbPath);
 
 // Routes
 app.use('/api/tasks', createTaskRouter(db));
@@ -29,13 +35,13 @@ app.use(errorHandler);
 async function start() {
   try {
     await db.initialize();
-    console.log('Database initialized');
-    
+    console.log('✅ Database initialized');
+
     app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
